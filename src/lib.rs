@@ -1,5 +1,9 @@
 use std::{sync::{Arc, Mutex, mpsc}, thread};
 
+/// A group of spawned threads ready to handle tasks in parallel.
+///
+/// The `ThreadPool` creates `size` threads on initialization and maintains a channel
+/// to send jobs (closures) to these threads.
 pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: Option<mpsc::Sender<Job>>,
@@ -8,6 +12,20 @@ pub struct ThreadPool {
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 impl ThreadPool {
+    /// Creates a new `ThreadPool`.
+    ///
+    /// The size is the number of threads in the pool.
+    ///
+    /// # Errors
+    ///
+    /// This function will panic if the size is 0.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hello::ThreadPool;
+    /// let pool = ThreadPool::build(4).unwrap();
+    /// ```
     pub fn new(size: usize) -> ThreadPool {
         assert!(size > 0);
 
@@ -27,6 +45,7 @@ impl ThreadPool {
         }
     }
 
+    /// Executes a closure on a thread in the pool.
     pub fn execute<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
