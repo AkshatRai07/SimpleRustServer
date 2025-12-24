@@ -1,96 +1,148 @@
-use std::{sync::{Arc, Mutex, mpsc}, thread};
+use std::{
+    fmt,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+};
 
-/// A group of spawned threads ready to handle tasks in parallel.
+/// Custom error type for ThreadPool operations.
+#[derive(Debug)]
+pub enum PoolError {
+    CreationError(String),
+    SendError(String),
+}
+
+impl fmt::Display for PoolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PoolError::CreationError(msg) => write!(f, "Pool Creation Error: {msg}"),
+            PoolError::SendError(msg) => write!(f, "Job Dispatch Error: {msg}"),
+        }
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// A group of spawned threads that are waiting and ready to handle tasks.
 ///
-/// The `ThreadPool` creates `size` threads on initialization and maintains a channel
-/// to send jobs (closures) to these threads.
+/// This manages a collection of `Worker` instances and uses a channel to
+/// dispatch closures to those workers.
 pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: Option<mpsc::Sender<Job>>,
 }
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
 impl ThreadPool {
-    /// Creates a new `ThreadPool`.
+    /// Create a new ThreadPool.
     ///
     /// The size is the number of threads in the pool.
     ///
     /// # Errors
     ///
-    /// This function will panic if the size is 0.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hello::ThreadPool;
-    /// let pool = ThreadPool::build(4).unwrap();
-    /// ```
-    pub fn new(size: usize) -> ThreadPool {
-        assert!(size > 0);
+    /// This function will return a `PoolError::CreationError` if the size is 0.
+    pub fn build(size: usize) -> Result<ThreadPool, PoolError> {
+        if size == 0 {
+            return Err(PoolError::CreationError("Pool size must be greater than zero".into()));
+        }
 
         let (sender, receiver) = mpsc::channel();
-
         let receiver = Arc::new(Mutex::new(receiver));
-
         let mut workers = Vec::with_capacity(size);
 
         for id in 0..size {
             workers.push(Worker::new(id, Arc::clone(&receiver)));
         }
 
-        ThreadPool {
+        Ok(ThreadPool {
             workers,
             sender: Some(sender),
-        }
+        })
     }
 
-    /// Executes a closure on a thread in the pool.
-    pub fn execute<F>(&self, f: F)
+    /// Sends a closure to the pool for execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PoolError::SendError` if the receiving side of the channel has been closed.
+    pub fn execute<F>(&self, f: F) -> Result<(), PoolError>
     where
         F: FnOnce() + Send + 'static,
     {
         let job = Box::new(f);
 
-        self.sender.as_ref().unwrap().send(job).unwrap();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| PoolError::SendError("ThreadPool sender is missing".into()))?
+            .send(job)
+            .map_err(|e| PoolError::SendError(e.to_string()))
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        for worker in self.workers.drain(..) {
-            println!("Shutting down worker {}", worker.id);
+        drop(self.sender.take());
 
-            worker.thread.join().unwrap();
+        for worker in self.workers.drain(..) {
+            if let Some(thread) = worker.thread {
+                thread.join().expect("Thread failed to join");
+            }
         }
     }
 }
 
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
-        let thread = thread::spawn(move || {
-            loop {
-                let message = receiver.lock().unwrap().recv();
+        let thread = thread::spawn(move || loop {
+            
+            let message = receiver.lock().expect("Mutex poisoned").recv();
 
-                match message {
-                    Ok(job) => {
-                        println!("Worker {id} got a job; executing.");
-
-                        job();
-                    }
-                    Err(_) => {
-                        println!("Worker {id} disconnected; shutting down.");
-                        break;
-                    }
-                }
+            match message {
+                Ok(job) => job(),
+                Err(_) => break,
             }
         });
 
-        Worker { id, thread }
+        Worker {
+            id,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_pool_creation() {
+        let pool = ThreadPool::build(4);
+        assert!(pool.is_ok());
+    }
+
+    #[test]
+    fn test_zero_size_pool_fails() {
+        let pool = ThreadPool::build(0);
+        assert!(pool.is_err());
+    }
+
+    #[test]
+    fn test_execution() {
+        let pool = ThreadPool::build(2).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..10 {
+            let c = Arc::clone(&counter);
+            pool.execute(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }).unwrap();
+        }
+
+        drop(pool);
+        assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
 }
